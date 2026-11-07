@@ -86,6 +86,16 @@ h1 { font: 800 1.6rem/1 var(--display); letter-spacing: .04em; text-transform: u
 .steps li.done { color: var(--led); border-color: var(--led); }
 .steps li.done::before { content: "✓ "; }
 .guide { margin: 0; font-size: .95rem; }
+.detect {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px;
+  border-radius: 10px; border: 1px solid var(--line); font: 500 .8rem/1 var(--mono); letter-spacing: .05em; text-transform: uppercase;
+}
+.detect b { font: 800 1.5rem/1 var(--display); letter-spacing: .06em; }
+.detect[data-d="on"] { border-color: var(--led); } .detect[data-d="on"] b { color: var(--led); }
+.detect[data-d="off"] { border-color: var(--off); } .detect[data-d="off"] b { color: var(--off); }
+.detect .seen { color: var(--muted); text-transform: none; letter-spacing: 0; }
+.detect .seen i { font-style: normal; color: var(--led); }
+.linkbtn { background: none; border: none; min-height: 0; padding: 4px 0; font: 500 .85rem/1.2 var(--body); color: var(--muted); text-decoration: underline; justify-self: start; }
 
 .meter { display: grid; gap: 6px; }
 .meter-row { display: flex; justify-content: space-between; font: 400 .75rem/1 var(--mono); color: var(--muted); }
@@ -163,8 +173,13 @@ ol.log li.empty { grid-template-columns: 1fr; color: var(--muted); font-family: 
       <li id="st1">Camera</li>
       <li id="st2">Learn LED on</li>
       <li id="st3">Learn LED off</li>
+      <li id="st4">Confirm</li>
     </ol>
     <p class="guide" id="guide">Point the back camera at the green LED, then tap “Turn on camera”.</p>
+    <div class="detect" id="detect" data-d="none" hidden>
+      <span>Detected now <span class="seen" id="seenText"></span></span><b id="detectText">—</b>
+    </div>
+    <button class="linkbtn" id="skipBtn" type="button" hidden>Skip the test (use default settings)</button>
   </section>
 
   <div class="meter" aria-live="off">
@@ -235,9 +250,11 @@ ol.log li.empty { grid-template-columns: 1fr; color: var(--muted); font-family: 
   };
 
   // ---------- state ----------
-  // phase: idle (no camera) → learnOn → learnOff → ready (test done)
+  // phase: idle (no camera) → learnOn → learnOff → confirm → ready
   const S = {
     stream: null, phase: "idle", busy: false,
+    skipped: false,                       // test bypassed: using the default line
+    seen: { on: false, off: false }, streak: { state: null, n: 0 },   // confirm step: has each state been detected?
     roi: { x: 0.5, y: 0.45, size: 0.22 },  // box center (0..1) and size as a fraction of picture width
     onLevel: null, offLevel: null,
     running: false, startedAt: 0, elapsedBefore: 0,
@@ -300,6 +317,7 @@ ol.log li.empty { grid-template-columns: 1fr; color: var(--muted); font-family: 
   // A moved or resized box sees different pixels, so the on/off test no longer applies.
   function invalidateTest(why) {
     if (!S.stream) return;
+    if (S.skipped) return;   // the default line doesn't depend on where the box is
     if (S.onLevel == null && S.offLevel == null && S.phase === "learnOn") return;
     if (S.running) pauseStopwatch("Paused — " + why.toLowerCase());
     S.onLevel = S.offLevel = null; S.phase = "learnOn";
@@ -366,12 +384,20 @@ ol.log li.empty { grid-template-columns: 1fr; color: var(--muted); font-family: 
       levelFill.style.width = Math.min(100, (r.score / meterMax()) * 100) + "%";
       let label = "green " + r.score.toFixed(0);
       const t = threshold();
-      if (t != null) { const on = r.score >= t; label += on ? " · ON" : " · OFF"; roiEl.classList.toggle("dark", !on); }
-      else roiEl.classList.remove("dark");
+      if (t != null) {
+        const on = r.score >= t; label += on ? " · ON" : " · OFF"; roiEl.classList.toggle("dark", !on);
+        $("detect").dataset.d = on ? "on" : "off"; $("detectText").textContent = on ? "ON" : "OFF";
+        if (S.phase === "confirm") trackConfirm(on ? "on" : "off");
+      } else roiEl.classList.remove("dark");
       levelText.textContent = label;
     }
     updateThreshMark();
     setTimeout(liveMeter, 300);
+  }
+  // Confirm step: a state counts as "seen" once it holds for 3 readings in a row (~1 s).
+  function trackConfirm(state) {
+    S.streak = S.streak.state === state ? { state, n: S.streak.n + 1 } : { state, n: 1 };
+    if (S.streak.n >= 3 && !S.seen[state]) { S.seen[state] = true; syncUI(); }
   }
   function updateThreshMark() {
     const t = threshold();
@@ -401,8 +427,9 @@ ol.log li.empty { grid-template-columns: 1fr; color: var(--muted); font-family: 
         showBanner("On and off look the same", "Move the camera closer, put the box tighter around the LED, or dim the room lights. Then do the test again from step 1.", true);
         return syncUI();
       }
-      S.offLevel = lvl; S.phase = "ready"; hideBanner();
-      addLog("off", "Learned LED OFF: green " + lvl.toFixed(0) + ". Switch the LED back on before starting.");
+      S.offLevel = lvl; S.phase = "confirm"; hideBanner();
+      S.seen = { on: false, off: false }; S.streak = { state: null, n: 0 };
+      addLog("off", "Learned LED OFF: green " + lvl.toFixed(0) + ". Now confirm it reads right.");
     }
     syncUI(); updateThreshMark();
   }
@@ -555,9 +582,17 @@ ol.log li.empty { grid-template-columns: 1fr; color: var(--muted); font-family: 
     setStatus(S.stream ? "live" : "idle", S.stream ? "Camera on" : "Camera off");
     syncUI();
   }
+  function skipTest() {
+    if (S.busy) return;
+    // Default line: an "on" score of 60 and "off" of 0 put the switch point at green 30 (the slider still moves it).
+    S.onLevel = 60; S.offLevel = 0; S.skipped = true; S.phase = "ready";
+    hideBanner();
+    addLog("info", "Test skipped. Using the default line (green " + threshold().toFixed(0) + ").");
+    syncUI(); updateThreshMark();
+  }
   function redoTest() {
     if (S.running) pauseStopwatch("Paused — redoing the test");
-    S.onLevel = S.offLevel = null; S.phase = "learnOn";
+    S.onLevel = S.offLevel = null; S.skipped = false; S.phase = "learnOn";
     hideBanner(); syncUI(); updateThreshMark();
   }
 
@@ -567,19 +602,34 @@ ol.log li.empty { grid-template-columns: 1fr; color: var(--muted); font-family: 
     $("st1").className = has ? "done" : "current";
     $("st2").className = S.onLevel != null ? "done" : (has && S.phase === "learnOn" ? "current" : "");
     $("st3").className = S.offLevel != null ? "done" : (has && S.phase === "learnOff" ? "current" : "");
+    $("st4").className = S.phase === "ready" ? "done" : (S.phase === "confirm" ? "current" : "");
+    if (S.skipped) { $("st2").className = $("st3").className = $("st4").className = ""; }
+
+    const both = S.seen.on && S.seen.off;
+    $("detect").hidden = !(has && calibrated());
+    $("seenText").innerHTML = S.phase === "confirm"
+      ? "· seen: <i>" + (S.seen.on ? "✓" : "–") + "</i> on, <i>" + (S.seen.off ? "✓" : "–") + "</i> off" : "";
+    $("skipBtn").hidden = !(has && !S.running && !S.skipped && ["learnOn", "learnOff", "confirm"].includes(S.phase));
 
     let label, guide;
     if (!has) { label = "Turn on camera"; guide = "Point the back camera at the green LED, then tap “Turn on camera”."; }
     else if (S.busy) { label = "Measuring…"; guide = "Hold still for a second…"; }
     else if (S.running) { label = "Pause"; guide = "Watching the green LED. The stopwatch stops when it goes off."; }
-    else if (S.phase === "learnOn") { label = "Learn LED ON"; guide = "Step 1 of 2: make sure the green LED is ON, then tap the button."; }
-    else if (S.phase === "learnOff") { label = "Learn LED OFF"; guide = "Step 2 of 2: now switch the LED OFF, then tap the button."; }
+    else if (S.phase === "learnOn") { label = "Learn LED ON"; guide = "Step 1 of 3: make sure the green LED is ON, then tap the button."; }
+    else if (S.phase === "learnOff") { label = "Learn LED OFF"; guide = "Step 2 of 3: now switch the LED OFF, then tap the button."; }
+    else if (S.phase === "confirm") {
+      label = "It matches — continue";
+      guide = both ? "Both states were detected correctly. If “Detected now” matched what the LED was doing, tap continue."
+        : "Step 3 of 3: confirm. Switch the LED on and off. “Detected now” must follow it. Waiting for " +
+          (!S.seen.on && !S.seen.off ? "both ON and OFF" : (S.seen.on ? "OFF" : "ON")) + "…";
+    }
     else {
       label = S.elapsedBefore > 0 ? "Resume stopwatch" : "Start stopwatch";
-      guide = "Test done (on " + S.onLevel.toFixed(0) + ", off " + S.offLevel.toFixed(0) + "). Switch the LED back ON, then tap start.";
+      guide = (S.skipped ? "Test skipped: using the default line (green " + threshold().toFixed(0) + "). Use “Check now” to see what it reads. "
+        : "Confirmed (on " + S.onLevel.toFixed(0) + ", off " + S.offLevel.toFixed(0) + "). ") + "Switch the LED ON, then tap start.";
     }
     mainBtn.textContent = label; guideEl.textContent = guide;
-    mainBtn.disabled = S.busy || S.checking;
+    mainBtn.disabled = S.busy || S.checking || (S.phase === "confirm" && !S.running && !both);
     checkNowBtn.disabled = !has || !calibrated() || S.busy || S.checking;
     redoBtn.disabled = !has || S.busy || (S.phase === "learnOn" && S.onLevel == null);
     resetBtn.disabled = !(S.running || S.elapsedBefore > 0);
@@ -591,8 +641,14 @@ ol.log li.empty { grid-template-columns: 1fr; color: var(--muted); font-family: 
     if (S.running) return pauseStopwatch();
     if (S.phase === "learnOn") return learn("on");
     if (S.phase === "learnOff") return learn("off");
+    if (S.phase === "confirm") {
+      S.phase = "ready"; hideBanner();
+      addLog("on", "Confirmed: the app read both on and off correctly.");
+      return syncUI();
+    }
     startStopwatch();
   });
+  $("skipBtn").addEventListener("click", skipTest);
   checkNowBtn.addEventListener("click", () => runCheck(true));
   redoBtn.addEventListener("click", redoTest);
   resetBtn.addEventListener("click", resetAll);
